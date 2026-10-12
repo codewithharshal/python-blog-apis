@@ -5,14 +5,14 @@ from typing import Annotated
 from database import get_db
 import models
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from sqlalchemy.orm import selectinload
 
 router = APIRouter()
 
 # Posts endpoints
-@router.get("/", response_model=list[PostResponse])
+@router.get("", response_model=list[PostResponse])
 async def get_posts(db:Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.Post))
+    result = await db.execute(select(models.Post).options(selectinload(models.Post.author)).order_by(models.Post.date_posted.desc()))
     posts = result.scalars().all()
     return posts
 
@@ -24,7 +24,7 @@ async def get_post(postId: int, db:Annotated[AsyncSession, Depends(get_db)]):
         return post
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post Not found")
 
-@router.post("/", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
 async def create_post(post: PostCreate, db:Annotated[AsyncSession, Depends(get_db)]):
     result = await db.execute(select(models.User).where(models.User.id == post.user_id))
     user = result.scalars().first()
