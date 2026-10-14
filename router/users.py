@@ -1,25 +1,30 @@
-from fastapi import APIRouter, HTTPException, status, Depends, UploadFile
-from schemas import PostResponse, Usercreate, UserResponse,  UserUpdate, Token, UserPrivate, UserPublic
+from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, Query
+from dto.schemas import PostResponse, Usercreate,  UserUpdate, Token, UserPrivate, UserPublic, PaginatedPostResponse
 from sqlalchemy import func, select
 from typing import Annotated
-from database import get_db
-import models
+from utils.database import get_db
+import model.models as models
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from datetime import timedelta
 from fastapi.security import OAuth2PasswordRequestForm
-from auth import creare_access_token, hash_password,CurrentUser, verify_password
-from config import settings
+from auth.auth import creare_access_token, hash_password,CurrentUser, verify_password
+from config.config import settings
 from PIL import UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
-from image import delete_profile_image, process_profile_image
+from utils.image import delete_profile_image, process_profile_image
 
 router = APIRouter()
 
 # Users endpoints
 @router.post("/",response_model=UserPrivate, status_code=status.HTTP_201_CREATED)
 async def create_users(user: Usercreate, db: Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.User).where(func.lower(models.User.username) == user.username.lower()))
+    result = await db.execute(
+        select(models.User).where(
+            func.lower(models.User.username) == user.username.lower(),
+        ),
+    )
+                            
 
     existing_user = result.scalars().first()
     if existing_user:
@@ -39,7 +44,7 @@ async def create_users(user: Usercreate, db: Annotated[AsyncSession, Depends(get
     new_user = models.User(
         username=user.username,
         email=user.email.lower(),
-        password_hash = hash_password
+        password_hash = hash_password(user.password)
     )
 
     db.add(new_user)
@@ -47,34 +52,92 @@ async def create_users(user: Usercreate, db: Annotated[AsyncSession, Depends(get
     await db.refresh(new_user)
     return new_user
 
+@router.get("/me", response_model=UserPrivate)
+async def get_current_user(current_user: CurrentUser):
+    return current_user
+
+@router.post("/token", response_model=Token)
+async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()],db:Annotated[AsyncSession, Depends(get_db)]):
+    # Look up user by email (case-insensitive)
+    # Note: OAuth2PasswordRequestForm uses "username" field, but we treat it as email
+    result = await db.execute(
+        select(models.User).where(
+            func.lower(models.User.username) == form_data.username.lower(),
+        ),
+    )
+
+    user = result.scalars().first()
+
+    # Verify user exists and password is correct
+    # Don't reveal which one failed (security best practice)
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Create access token with user id as subject
+    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
+    access_token = creare_access_token(
+        data={"sub": str(user.id)},
+        expires_delta=access_token_expires,
+    )
+    return Token(access_token=access_token, token_type="bearer")
+
 @router.get("/{user_id}", response_model=UserPublic)
-async def get_user(userId:int, db: Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.User).where(models.User.id == userId))
+async def get_user(user_id:int, db: Annotated[AsyncSession, Depends(get_db)]):
+    result = await db.execute(select(models.User).where(models.User.id == user_id))
     user = result.scalars().first()
     if user:
         return user
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-@router.get("/{user_id}/posts", response_model=list[PostResponse])
-async def get_user_posts(userId:int, db:Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.User).where(models.User.id == userId))
+@router.get("/{user_id}/posts", response_model=PaginatedPostResponse)
+async def get_user_posts(user_id:int, db:Annotated[AsyncSession, Depends(get_db)], skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = settings.post_per_page):
+    result = await db.execute(select(models.User).where(models.User.id == user_id))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    result = await db.execute(select(models.Post).options(selectinload(models.Post.author)).where(models.Post.user_id == userId).order_by(models.Post.date_posted.desc()))
+
+    count_result = await db.execute(
+        select(func.count())
+        .select_from(models.Post)
+        .where(models.Post.user_id == user_id),
+    )
+    total = count_result.scalar() or 0
+    
+    result = await db.execute(
+        select(models.Post)
+        .options(selectinload(models.Post.author))
+        .where(models.Post.user_id == user_id)
+        .order_by(models.Post.date_posted.desc())
+        .offset(skip)
+        .limit(limit),
+    )
+    
     posts = result.scalars().all()
-    return posts
+    has_more = skip + len(posts) < total
+
+    return PaginatedPostResponse(
+        posts=[PostResponse.model_validate(post) for post in posts],
+        total=total,
+        skip=skip,
+        limit=limit,
+        has_more=has_more,
+    )
 
 @router.patch("/{user_id}", response_model=UserPrivate)
-async def update_user(userId:int, current_user:CurrentUser , user_update:UserUpdate, db:Annotated[AsyncSession, Depends(get_db)]):
+async def update_user(user_id:int, current_user:CurrentUser , user_update:UserUpdate, db:Annotated[AsyncSession, Depends(get_db)]):
 
-    if userId != current_user.id:
+    if user_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to update this user",
         )
 
-    result = await db.execute(select(models.User).where(models.User.id == userId))
+    result = await db.execute(select(models.User).where(models.User.id == user_id))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status=status.HTTP_404_NOT_FOUND, detail="User not found")
@@ -126,41 +189,6 @@ async def delete_user(user_id: int,current_user:CurrentUser, db: Annotated[Async
 
     if old_filename:
         delete_profile_image(old_filename)
-
-@router.post("/token", response_model=Token)
-async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()],db:Annotated[AsyncSession, Depends(get_db)]):
-    # Look up user by email (case-insensitive)
-    # Note: OAuth2PasswordRequestForm uses "username" field, but we treat it as email
-    result = await db.execute(
-        select(models.User).where(
-            func.lower(models.User.email) == form_data.username.lower(),
-        ),
-    )
-
-    user = result.scalars().first()
-
-    # Verify user exists and password is correct
-    # Don't reveal which one failed (security best practice)
-    if not user or not verify_password(form_data.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Create access token with user id as subject
-    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
-    access_token = creare_access_token(
-        data={"sub": str(user.id)},
-        expires_delta=access_token_expires,
-    )
-    return Token(access_token=access_token, token_type="bearer")
-
-
-@router.get("/me", response_model=UserPrivate)
-async def get_current_user(current_user: CurrentUser):
-    return current_user
-
 
 @router.patch("/{user_id}/picture", response_model=UserPrivate)
 async def upload_profile_picture(

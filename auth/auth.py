@@ -2,13 +2,13 @@ from datetime import UTC, datetime, timedelta
 import jwt
 from fastapi.security import OAuth2PasswordBearer
 from pwdlib import PasswordHash
-from config import setting
+from config.config import settings
 from typing import Annotated
 from fastapi import Depends ,HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-import models
-from database import get_db
+import model.models as models
+from utils.database import get_db
 
 password_hash = PasswordHash.recommended()
 
@@ -26,10 +26,10 @@ def creare_access_token(data: dict, expires_delta: timedelta | None = None):
     if expires_delta:
         expire = datetime.now(UTC) + expires_delta
     else:
-        expire = datetime.now(UTC) + timedelta(minutes=setting.access_token_expire_minutes)
+        expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     to_encode.update({"exp":expire})
 
-    encode_jwt = jwt.encode(to_encode, setting.secret_key.get_secret_value(), algorithm=setting.algorithm)
+    encode_jwt = jwt.encode(to_encode, settings.secret_key.get_secret_value(), algorithm=settings.algorithm)
 
     return encode_jwt
 
@@ -37,7 +37,7 @@ def verify_access_token(token:str) -> str | None:
     '''Verify a JWT access token and return the subject (user id) if valid'''
 
     try:
-        payload = jwt.decode(token, setting.secret_key.get_secret_value(),algorithms=[setting.algorithm],options={"require":["exp", "sub"]})
+        payload = jwt.decode(token, settings.secret_key.get_secret_value(),algorithms=[settings.algorithm],options={"require":["exp", "sub"]})
     except jwt.InvalidTokenError:
         return None
     else:

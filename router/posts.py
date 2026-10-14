@@ -1,43 +1,68 @@
-from fastapi import APIRouter, HTTPException, status, Depends
-from schemas import PostCreate, PostResponse, PostUpdate
-from sqlalchemy import select
+from fastapi import APIRouter, HTTPException, status, Depends,Query
+from dto.schemas import PostCreate, PostResponse, PostUpdate, PaginatedPostResponse
+from sqlalchemy import select,func
 from typing import Annotated
-from database import get_db
-import models
+from utils.database import get_db
+import model.models as models
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from auth import CurrentUser
+from auth.auth import CurrentUser
+from config.config import settings
 
 router = APIRouter()
 
 # Posts endpoints
-@router.get("", response_model=list[PostResponse])
-async def get_posts(db:Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.Post).options(selectinload(models.Post.author)).order_by(models.Post.date_posted.desc()))
+@router.get("", response_model=PaginatedPostResponse)
+async def get_posts(db:Annotated[AsyncSession, Depends(get_db)], skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = settings.post_per_page):
+
+    count_result = await db.execute(select(func.count()).select_from(models.Post))
+    total = count_result.scalar() or 0
+
+
+    result = await db.execute(
+        select(models.Post)
+        .options(selectinload(models.Post.author))
+        .order_by(models.Post.date_posted.desc())
+        .offset(skip)
+        .limit(limit),
+    )
+
     posts = result.scalars().all()
-    return posts
 
-@router.get("/{post_id}", response_model=PostResponse)
-async def get_post(postId: int, db:Annotated[AsyncSession, Depends(get_db)]):
-    result = await db.execute(select(models.Post).where(models.Post.id == postId))
-    post = result.scalars().first()
-    if post:
-        return post
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post Not found")
+    has_more = skip + len(posts) < total
 
+    return PaginatedPostResponse(
+        posts=[PostResponse.model_validate(post) for post in posts],
+        total=total,
+        skip=skip,
+        limit=limit,
+        has_more=has_more,
+    )
+    
 @router.post("", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
 async def create_post(post: PostCreate, current_user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]):
     new_post = models.Post(
         title=post.title,
         content=post.content,
-        user_id = current_user.user_id
+        user_id = current_user.id
     )
 
     db.add(new_post)
     await db.commit()
     await db.refresh(new_post)
     return new_post
-    
+   
+
+@router.get("/{post_id}", response_model=PostResponse)
+async def get_post(post_id: int, db:Annotated[AsyncSession, Depends(get_db)]):
+    result = await db.execute(select(models.Post).where(models.Post.id == post_id))
+    post = result.scalars().first()
+    if post:
+        return post
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post Not found")
+
+ 
 @router.put("/{post_id}", response_model=PostResponse)
 async def update_post_full(
     post_id: int,

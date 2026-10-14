@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
-from database import Base, engin
+from utils.database import Base, engin
 from contextlib import asynccontextmanager
 from router import posts, users
 
